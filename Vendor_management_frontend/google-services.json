@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "331400730155",
+    "project_id": "vendor-management-erp",
+    "storage_bucket": "vendor-management-erp.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:331400730155:android:c5d2b4997f4810af6afc6e",
+        "android_client_info": {
+          "package_name": "com.vendor.management"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBc_9pjKQkZ4-8JHYA-dciqvoudEi0nJ_E"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

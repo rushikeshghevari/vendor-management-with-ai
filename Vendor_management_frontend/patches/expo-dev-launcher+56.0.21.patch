@@ -1,0 +1,106 @@
+diff --git a/node_modules/expo-dev-launcher/android/src/debug/java/expo/modules/devlauncher/launcher/manifest/DevLauncherManifestParser.kt b/node_modules/expo-dev-launcher/android/src/debug/java/expo/modules/devlauncher/launcher/manifest/DevLauncherManifestParser.kt
+index 714891a..c2ee8e2 100644
+--- a/node_modules/expo-dev-launcher/android/src/debug/java/expo/modules/devlauncher/launcher/manifest/DevLauncherManifestParser.kt
++++ b/node_modules/expo-dev-launcher/android/src/debug/java/expo/modules/devlauncher/launcher/manifest/DevLauncherManifestParser.kt
+@@ -1,14 +1,21 @@
+ package expo.modules.devlauncher.launcher.manifest
+ 
+ import android.net.Uri
++import android.util.Log
+ import expo.modules.devlauncher.helpers.await
+ import expo.modules.devlauncher.helpers.fetch
+ import expo.modules.manifests.core.Manifest
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
+ import okhttp3.Headers
+ import okhttp3.Headers.Companion.toHeaders
+ import okhttp3.OkHttpClient
++import okhttp3.Response
+ import org.json.JSONObject
++import java.io.IOException
+ import java.io.Reader
++import java.net.InetAddress
++import java.security.cert.X509Certificate
+ 
+ class DevLauncherManifestParser(
+   private val httpClient: OkHttpClient,
+@@ -16,7 +23,7 @@ class DevLauncherManifestParser(
+   private val installationID: String?
+ ) {
+   suspend fun isManifestUrl(): Boolean {
+-    val response = fetch(url, "HEAD", getHeaders()).await(httpClient)
++    val response = fetchWithFallback(url, "HEAD", getHeaders())
+     val contentType = response.header("Content-Type")
+     // published projects may respond unsuccessfully to HEAD requests sent with no headers
+     return !response.isSuccessful ||
+@@ -25,7 +32,7 @@ class DevLauncherManifestParser(
+   }
+ 
+   private suspend fun downloadManifest(): Reader {
+-    val response = fetch(url, "GET", getHeaders()).await(httpClient)
++    val response = fetchWithFallback(url, "GET", getHeaders())
+     if (!response.isSuccessful) {
+       throw Exception("Failed to open app.\n\nIf you are trying to load the app from a development server, check your network connectivity and make sure you can access the server from your device.\n\nIf you are trying to open a published project, install a compatible version of expo-updates and follow all setup and integration steps.")
+     }
+@@ -39,6 +46,61 @@ class DevLauncherManifestParser(
+     }
+   }
+ 
++  // Android's conscrypt TLS stack rejects hostnames containing '_' via IDN.toASCII when
++  // creating an SNIHostName, producing IOException("Android internal error"). Expo tunnel
++  // URLs embed the EAS account username which may contain underscores (e.g. rushikesh_243).
++  // Fix: resolve the hostname to an IP (digits-and-dots SNI is STD3-compliant so won't
++  // throw), connect to the IP, and verify the TLS certificate against the original hostname
++  // so certificate chain validation is fully preserved.
++  private suspend fun fetchWithFallback(urlArg: Uri, method: String, headers: Headers): Response {
++    return try {
++      fetch(urlArg, method, headers).await(httpClient)
++    } catch (e: IOException) {
++      val host = urlArg.host
++      if (e.message == "Android internal error" && host != null && '_' in host) {
++        val addresses = withContext(Dispatchers.IO) {
++          runCatching { InetAddress.getAllByName(host).toList() }.getOrElse { emptyList() }
++        }
++        val ip = addresses.firstOrNull()?.hostAddress ?: throw e
++        val scheme = urlArg.scheme ?: "https"
++        val path = urlArg.path ?: ""
++        val query = urlArg.query?.let { "?$it" } ?: ""
++        val ipUrl = Uri.parse("$scheme://$ip$path$query")
++        val headersWithHost = headers.newBuilder().set("Host", host).build()
++        Log.d("DevLauncherManifest", "fetchWithFallback: $method $urlArg → $ipUrl (Host: $host)")
++        // The TrustManager continues to validate the full certificate chain from a system
++        // trusted CA.  Only hostname verification is customised: we first try the original
++        // hostname (ideal), then accept if the CA-verified cert covers any known Expo/ngrok
++        // infrastructure domain.  exp.direct is served by ngrok; its TLS certs may list
++        // *.ngrok-free.dev / *.ngrok.io rather than *.exp.direct, so a direct hostname
++        // match fails even though we are talking to the correct server.
++        val ipClient = httpClient.newBuilder()
++          .hostnameVerifier { _, session ->
++            val defaultVerifier = javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier()
++            if (defaultVerifier.verify(host, session)) return@hostnameVerifier true
++            runCatching {
++              val cert = session.peerCertificates.firstOrNull() as? X509Certificate
++              cert?.subjectAlternativeNames?.any { san ->
++                san.size >= 2 && san[0] == 2 /* dNSName */ &&
++                  (san[1] as? String)?.let { name ->
++                    name.endsWith(".exp.direct")      || name == "exp.direct"   ||
++                    name.endsWith(".ngrok.io")        || name == "ngrok.io"     ||
++                    name.endsWith(".ngrok-free.dev")  ||
++                    name.endsWith(".ngrok-free.app")  ||
++                    name.endsWith(".ngrok.app")       ||
++                    name.endsWith(".ngrok.dev")
++                  } == true
++              } == true
++            }.getOrDefault(false)
++          }
++          .build()
++        fetch(ipUrl, method, headersWithHost).await(ipClient)
++      } else {
++        throw e
++      }
++    }
++  }
++
+   private fun getHeaders(): Headers {
+     val headersMap = mutableMapOf(
+       "expo-platform" to "android",

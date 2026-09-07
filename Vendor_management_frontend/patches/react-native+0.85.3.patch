@@ -1,0 +1,72 @@
+diff --git a/node_modules/react-native/ReactAndroid/src/main/java/com/facebook/react/devsupport/CxxInspectorPackagerConnection.kt b/node_modules/react-native/ReactAndroid/src/main/java/com/facebook/react/devsupport/CxxInspectorPackagerConnection.kt
+index c6b6b78..21e9a7f 100644
+--- a/node_modules/react-native/ReactAndroid/src/main/java/com/facebook/react/devsupport/CxxInspectorPackagerConnection.kt
++++ b/node_modules/react-native/ReactAndroid/src/main/java/com/facebook/react/devsupport/CxxInspectorPackagerConnection.kt
+@@ -49,6 +49,8 @@ internal class CxxInspectorPackagerConnection(
+   @DoNotStrip
+   private class WebSocketDelegate @DoNotStrip constructor(private val mHybridData: HybridData) :
+       Closeable {
++    @Volatile var isClosed: Boolean = false
++
+     external fun didFailWithError(posixCode: Int?, error: String?)
+ 
+     external fun didReceiveMessage(message: String?)
+@@ -62,6 +64,7 @@ internal class CxxInspectorPackagerConnection(
+      * delegate is not needed anymore ( = the socket will not send more events).
+      */
+     override fun close() {
++      isClosed = true
+       mHybridData.resetNative()
+     }
+   }
+@@ -188,31 +191,39 @@ internal class CxxInspectorPackagerConnection(
+                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                   scheduleCallback(
+                       {
+-                        val message = t.message
+-                        delegate.didFailWithError(null, message ?: "<Unknown error>")
+-                        // "No further calls to this listener will be made." -OkHttp docs for
+-                        // WebSocketListener.onFailure
+-                        delegate.close()
++                        if (!delegate.isClosed) {
++                          val message = t.message
++                          delegate.didFailWithError(null, message ?: "<Unknown error>")
++                          // "No further calls to this listener will be made." -OkHttp docs for
++                          // WebSocketListener.onFailure
++                          delegate.close()
++                        }
+                       },
+                       delayMs = 0,
+                   )
+                 }
+ 
+                 override fun onMessage(webSocket: WebSocket, text: String) {
+-                  scheduleCallback({ delegate.didReceiveMessage(text) }, delayMs = 0)
++                  scheduleCallback({
++                    if (!delegate.isClosed) delegate.didReceiveMessage(text)
++                  }, delayMs = 0)
+                 }
+ 
+                 override fun onOpen(webSocket: WebSocket, response: Response) {
+-                  scheduleCallback({ delegate.didOpen() }, delayMs = 0)
++                  scheduleCallback({
++                    if (!delegate.isClosed) delegate.didOpen()
++                  }, delayMs = 0)
+                 }
+ 
+                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                   scheduleCallback(
+                       {
+-                        delegate.didClose()
+-                        // "No further calls to this listener will be made." -OkHttp docs for
+-                        // WebSocketListener.onClosed
+-                        delegate.close()
++                        if (!delegate.isClosed) {
++                          delegate.didClose()
++                          // "No further calls to this listener will be made." -OkHttp docs for
++                          // WebSocketListener.onClosed
++                          delegate.close()
++                        }
+                       },
+                       delayMs = 0,
+                   )
