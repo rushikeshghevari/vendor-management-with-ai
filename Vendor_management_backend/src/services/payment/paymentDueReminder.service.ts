@@ -1,0 +1,283 @@
+/**
+ * Payment-due reminder — runs on a 1-day interval, same in-process `setInterval` pattern as
+ * escalation.service.ts / recurringExpenseReminder.service.ts.
+ *
+ * Two sources feed the same "payment coming up" notification to Payment Department:
+ *  - Bill.dueDate, for bills already VERIFIED/PAYMENT_PENDING — a confirmed amount
+ *    (invoiceAmount), since the real invoice already exists.
+ *  - RecurringExpense.nextDueDate, for a series whose cycle hasn't been generated yet — a
+ *    tentative amount (the originally Director-approved baseline), flagged as such since the
+ *    real invoice amount is only known once someone actually generates that cycle.
+ *
+ * "Within N days" always means daysRemaining <= N, which naturally includes 0 and negative
+ * (overdue) — an overdue payment keeps getting a daily nudge for as long as it stays unpaid,
+ * the same self-correcting design already used by recurringExpenseReminder's own due check.
+ * dedupKey is scoped to today's date, so a restart never re-sends today's reminder twice, but
+ * tomorrow's tick still sends a fresh one for as long as the payment remains outstanding.
+ */
+
+import { Types } from 'mongoose';
+
+import { ROLES } from '@/constants/roles';
+import { BILL_STATUS } from '@/constants/status';
+import { Bill } from '@/modules/bill/bill.model';
+import { DirectorReview } from '@/modules/directorReview/directorReview.model';
+import { notificationService } from '@/modules/notification/notification.service';
+import { RecurringExpense } from '@/modules/recurringExpense/recurringExpense.model';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const REMINDER_WINDOW_DAYS = 7;
+
+function daysRemaining(dueDate: Date, now: Date): number {
+  return Math.ceil((dueDate.getTime() - now.getTime()) / DAY_MS);
+}
+
+function formatDaysText(days: number): string {
+  if (days < 0) return `overdue by ${Math.abs(days)} day${Math.abs(days) === 1 ? '' : 's'}`;
+  if (days === 0) return 'due today';
+  return `due in ${days} day${days === 1 ? '' : 's'}`;
+}
+
+interface ApprovalLike {
+  decision: string;
+  decidedAt: Date;
+  director?: { name?: string } | null;
+}
+
+/** Renders a Quotation's director-approval roster as one readable string — used so the Payment
+ *  Department reminder always states who approved the spend, not just the amount and date. */
+export function formatQuotationApprovals(
+  quotation: { directorApprovals?: ApprovalLike[] } | null | undefined,
+): string {
+  const approvals = (quotation?.directorApprovals ?? []).filter((a) => a.decision === 'approved');
+  if (approvals.length === 0) return 'no Director approval on record';
+  return approvals
+    .map((a) => `${a.director?.name ?? 'a Director'} (${new Date(a.decidedAt).toLocaleDateString('en-IN')})`)
+    .join(', ');
+}
+
+/** The raw timestamp of the first Director approval on record, for a consumer that wants a
+ *  parseable date rather than `formatQuotationApprovals`' human-readable string. `null` when
+ *  no Director has approved yet — same "not approved" case `formatQuotationApprovals` reports. */
+export function getFirstApprovalDate(
+  quotation: { directorApprovals?: ApprovalLike[] } | null | undefined,
+): Date | null {
+  const approved = (quotation?.directorApprovals ?? []).find((a) => a.decision === 'approved');
+  return approved ? new Date(approved.decidedAt) : null;
+}
+
+interface DirectorReviewApprovalEntryLike {
+  directorName: string;
+  decision: string;
+  decidedAt?: Date;
+}
+
+interface DirectorReviewLike {
+  decision: string;
+  decisionDate?: Date;
+  selectedQuotation?: { amount?: number; advanceAmount?: number; expectedDeliveryDate?: Date; expectedPODate?: Date } | null;
+  approvals: DirectorReviewApprovalEntryLike[];
+}
+
+export interface QuotationApprovalInfo {
+  approvedAt: Date | null;
+  approvalText: string;
+  approvedAmount: number;
+  /** How much of `approvedAmount` the vendor wants paid before the PO/goods — 0 when the
+   *  quotation never set one. `approvedAmount - advanceAmount` is the balance, due per the
+   *  quotation's own `creditPeriod` once the approved amount is actually raised as a PO. */
+  advanceAmount: number;
+  /** The vendor's own promised delivery date, from whichever quotation actually got approved
+   *  (may differ from the department's original "prepared" pick if a Director overrode it). */
+  expectedDeliveryDate: Date | null;
+  /** When the department expects to raise the PO — the real deadline for `advanceAmount`. */
+  expectedPODate: Date | null;
+}
+
+/** A Requirement-linked Quotation (the normal Requirement → Quotation → Dual Director
+ *  Approval flow) never gets its own `directorApprovals[]` populated — that field only fills
+ *  in for the separate standalone-quotation approval path (CEO/Director amount-based routing
+ *  for quotations with no `requirement`). The real dual-approval record for a Requirement-
+ *  linked quotation lives on its `DirectorReview` document instead, keyed by `requirement`.
+ *  Batch-loads every review needed for a page of results in one query, so a consumer never
+ *  fires one query per quotation. */
+export async function loadDirectorReviewsByRequirement(
+  requirementIds: Array<unknown>,
+): Promise<Map<string, DirectorReviewLike>> {
+  const ids = [...new Set(requirementIds.filter(Boolean).map((id) => String(id)))]
+    .filter((id) => Types.ObjectId.isValid(id));
+  if (ids.length === 0) return new Map();
+
+  const reviews = await DirectorReview.find({ requirement: { $in: ids } })
+    .populate('selectedQuotation', 'amount advanceAmount expectedDeliveryDate expectedPODate')
+    .select('requirement decision decisionDate selectedQuotation approvals')
+    .lean();
+
+  return new Map(reviews.map((r) => [String(r.requirement), r as unknown as DirectorReviewLike]));
+}
+
+/**
+ * Resolves approval date/text/amount for one quotation, preferring its Requirement's
+ * DirectorReview record (the real source of truth for a Requirement-linked quotation) and
+ * falling back to the quotation's own `directorApprovals[]` for a standalone quotation that
+ * was never linked to a Requirement at all (no entry in `reviewMap` either way).
+ */
+export function resolveQuotationApproval(
+  quotation:
+    | {
+        requirement?: unknown;
+        amount?: number;
+        advanceAmount?: number;
+        expectedDeliveryDate?: Date;
+        expectedPODate?: Date;
+        directorApprovals?: ApprovalLike[];
+      }
+    | null
+    | undefined,
+  reviewMap: Map<string, DirectorReviewLike>,
+): QuotationApprovalInfo {
+  const requirementId = quotation?.requirement ? String(quotation.requirement) : undefined;
+  const review = requirementId ? reviewMap.get(requirementId) : undefined;
+
+  if (review) {
+    const approvedEntries = review.approvals.filter((a) => a.decision === 'approved');
+    const approvalText = approvedEntries.length
+      ? approvedEntries.map((a) => `${a.directorName} (${a.decidedAt ? new Date(a.decidedAt).toLocaleDateString('en-IN') : 'date unknown'})`).join(', ')
+      : 'no Director approval on record';
+    // Only a fully-approved review (every Director, not just one so far) counts as "approved"
+    // — matches Requirement.status only becoming APPROVED once every entry is.
+    const fullyApproved = review.decision === 'approved';
+    return {
+      approvedAt: fullyApproved && review.decisionDate ? new Date(review.decisionDate) : null,
+      approvalText,
+      approvedAmount: review.selectedQuotation?.amount ?? quotation?.amount ?? 0,
+      advanceAmount: review.selectedQuotation?.advanceAmount ?? quotation?.advanceAmount ?? 0,
+      expectedDeliveryDate: review.selectedQuotation?.expectedDeliveryDate
+        ? new Date(review.selectedQuotation.expectedDeliveryDate)
+        : quotation?.expectedDeliveryDate
+          ? new Date(quotation.expectedDeliveryDate)
+          : null,
+      expectedPODate: review.selectedQuotation?.expectedPODate
+        ? new Date(review.selectedQuotation.expectedPODate)
+        : quotation?.expectedPODate
+          ? new Date(quotation.expectedPODate)
+          : null,
+    };
+  }
+
+  return {
+    approvedAt: getFirstApprovalDate(quotation),
+    approvalText: formatQuotationApprovals(quotation),
+    approvedAmount: quotation?.amount ?? 0,
+    advanceAmount: quotation?.advanceAmount ?? 0,
+    expectedDeliveryDate: quotation?.expectedDeliveryDate ? new Date(quotation.expectedDeliveryDate) : null,
+    expectedPODate: quotation?.expectedPODate ? new Date(quotation.expectedPODate) : null,
+  };
+}
+
+async function notifyBillsDue(now: Date): Promise<void> {
+  const paymentTeam = await notificationService.findActiveUsersByRole(ROLES.PAYMENT_DEPARTMENT);
+  if (paymentTeam.length === 0) return;
+
+  const cutoff = new Date(now.getTime() + REMINDER_WINDOW_DAYS * DAY_MS);
+  const bills = await Bill.find({
+    status: { $in: [BILL_STATUS.VERIFIED, BILL_STATUS.PAYMENT_PENDING] },
+    isDeleted: { $ne: true },
+    dueDate: { $lte: cutoff },
+  })
+    .populate('vendor', 'name')
+    .populate('reimbursedTo', 'name')
+    .populate({ path: 'quotation', populate: { path: 'directorApprovals.director', select: 'name' } })
+    .lean();
+
+  const reviewMap = await loadDirectorReviewsByRequirement(
+    bills.map((bill) => (bill.quotation as unknown as { requirement?: unknown } | null)?.requirement),
+  );
+
+  const today = now.toISOString().slice(0, 10);
+
+  for (const bill of bills) {
+    const vendor = bill.vendor as unknown as { name?: string } | null;
+    const reimbursedTo = bill.reimbursedTo as unknown as { name?: string } | null;
+    const payee = vendor?.name ?? reimbursedTo?.name ?? 'Unknown';
+    const days = daysRemaining(bill.dueDate, now);
+    const approvalsText = resolveQuotationApproval(
+      bill.quotation as unknown as { requirement?: unknown; amount?: number; directorApprovals?: ApprovalLike[] },
+      reviewMap,
+    ).approvalText;
+
+    await notificationService
+      .notifyUsers(paymentTeam, {
+        title: 'Payment Due Soon',
+        message: `${bill.billCode} — ₹${bill.invoiceAmount.toLocaleString('en-IN')} for ${payee}, ${formatDaysText(days)}. Approved by: ${approvalsText}.`,
+        module: 'bill',
+        relatedRecord: String(bill._id),
+        notificationType: 'payment_due_reminder',
+        priority: days <= 2 ? 'critical' : days <= 5 ? 'high' : 'medium',
+        category: 'warning',
+        dedupKey: `payment-due:${today}:${bill._id}`,
+      })
+      .catch((err) => console.error(`[payment-due] notify failed for bill ${bill._id}:`, err));
+  }
+}
+
+async function notifyRecurringDue(now: Date): Promise<void> {
+  const paymentTeam = await notificationService.findActiveUsersByRole(ROLES.PAYMENT_DEPARTMENT);
+  if (paymentTeam.length === 0) return;
+
+  const cutoff = new Date(now.getTime() + REMINDER_WINDOW_DAYS * DAY_MS);
+  const series = await RecurringExpense.find({
+    isActive: true,
+    nextDueDate: { $lte: cutoff },
+  })
+    .populate('vendor', 'name')
+    .populate('reimbursedTo', 'name')
+    .lean();
+
+  const today = now.toISOString().slice(0, 10);
+
+  for (const item of series) {
+    const vendor = item.vendor as unknown as { name?: string } | null;
+    const reimbursedTo = item.reimbursedTo as unknown as { name?: string } | null;
+    const payee = vendor?.name ?? reimbursedTo?.name ?? 'Unknown';
+    const days = daysRemaining(item.nextDueDate, now);
+
+    await notificationService
+      .notifyUsers(paymentTeam, {
+        title: 'Upcoming Recurring Payment (Tentative)',
+        message: `${item.title} — approx ₹${item.baselineAmount.toLocaleString('en-IN')} for ${payee}, ${formatDaysText(days)}. Actual invoice not generated yet — amount may change.`,
+        module: 'bill',
+        relatedRecord: String(item._id),
+        notificationType: 'payment_due_reminder',
+        priority: days <= 2 ? 'high' : 'medium',
+        category: 'information',
+        dedupKey: `recurring-payment-due:${today}:${item._id}`,
+      })
+      .catch((err) => console.error(`[payment-due] notify failed for series ${item._id}:`, err));
+  }
+}
+
+async function runPaymentDueCheck(): Promise<void> {
+  const now = new Date();
+  await notifyBillsDue(now).catch((err) => console.error('[payment-due] bill check failed:', err));
+  await notifyRecurringDue(now).catch((err) => console.error('[payment-due] recurring check failed:', err));
+}
+
+let intervalHandle: ReturnType<typeof setInterval> | null = null;
+
+export function startPaymentDueReminderScheduler(): void {
+  if (intervalHandle) return; // already running
+  runPaymentDueCheck().catch((err) => console.error('[payment-due] initial run failed:', err));
+  intervalHandle = setInterval(
+    () => runPaymentDueCheck().catch((err) => console.error('[payment-due] run failed:', err)),
+    DAY_MS,
+  );
+  console.info(`[payment-due] Payment due reminder scheduler started (24h interval, ${REMINDER_WINDOW_DAYS}-day window)`);
+}
+
+export function stopPaymentDueReminderScheduler(): void {
+  if (intervalHandle) {
+    clearInterval(intervalHandle);
+    intervalHandle = null;
+  }
+}
